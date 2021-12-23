@@ -5,6 +5,7 @@
 YOLOX_outputs/
 datasets/
 checkpoints/
+assets/
 # do not ignore datasets under yolox/data
 !*yolox/data/datasets/
 
