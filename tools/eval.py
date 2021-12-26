@@ -143,6 +143,7 @@ def main(exp, args, num_gpu):
     logger.info("Model Structure:\n{}".format(str(model)))
 
     evaluator = exp.get_evaluator(args.batch_size, is_distributed, args.test, args.legacy)
+    # 这里表明eval函数不会调用训练集用于测试训练结果，它使用了实验文档的get evaluator方法
 
     torch.cuda.set_device(rank)
     model.cuda(rank)
@@ -168,7 +169,7 @@ def main(exp, args, num_gpu):
 
     if args.trt:
         assert (
-            not args.fuse and not is_distributed and args.batch_size == 1
+                not args.fuse and not is_distributed and args.batch_size == 1
         ), "TensorRT model is not support model fusing and distributed inferencing!"
         trt_file = os.path.join(file_name, "model_trt.pth")
         assert os.path.exists(

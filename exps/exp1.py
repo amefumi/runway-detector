@@ -29,6 +29,9 @@ class Exp(MyExp):
         self.warmup_epochs = 1
         self.max_epoch = 100  # 更改epoch为100，减少训练时间。
         self.data_num_workers = 2  # 减少loader workers为2
+
+        # -----------track config -----------------#
+
         # ---------- transform config ------------ #
         self.mosaic_prob = 1.0
         self.mixup_prob = 1.0

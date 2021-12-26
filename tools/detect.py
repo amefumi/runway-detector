@@ -15,14 +15,20 @@ from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess, vis
-from yolox.utils.visualize import plot_tracking
-from yolox.tracker.byte_tracker import BYTETracker
+
+'''
+Author: Bruce
+
+Date: 2021/12/23
+
+本代码的试图改变利用网络的方法，是对demo.py的重写
+'''
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
 
 def make_parser():
-    parser = argparse.ArgumentParser("YOLOX Demo!")
+    parser = argparse.ArgumentParser("YOLOX Runway detector")
     parser.add_argument(
         "demo", default="image", help="demo type, eg. image, video and webcam"
     )
@@ -85,12 +91,6 @@ def make_parser():
         action="store_true",
         help="Using TensorRT model for testing.",
     )
-    # tracking args
-    parser.add_argument("--track_thresh", type=float, default=0.5, help="tracking confidence threshold")
-    parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
-    parser.add_argument("--match_thresh", type=float, default=0.6, help="matching threshold for tracking")
-    parser.add_argument('--min_box_area', type=float, default=4, help='filter out tiny boxes')
-    parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")  # TODO: 去掉无用的parser
     return parser
 
 
@@ -106,16 +106,19 @@ def get_image_list(path):
 
 
 class Predictor(object):
+    """
+    要按照不同方法利用训练出来的模型，主要就是要重写Predictor类，使它在推理时按照不同的小区域来考虑。
+    """
     def __init__(
-        self,
-        model,
-        exp,
-        cls_names=COCO_CLASSES,
-        trt_file=None,
-        decoder=None,
-        device="cpu",
-        fp16=False,
-        legacy=False,
+            self,
+            model,
+            exp,
+            cls_names=COCO_CLASSES,
+            trt_file=None,
+            decoder=None,
+            device="cpu",
+            fp16=False,
+            legacy=False,
     ):
         self.model = model
         self.cls_names = cls_names
@@ -143,7 +146,7 @@ class Predictor(object):
             img_info["file_name"] = os.path.basename(img)
             img = cv2.imread(img)
         else:
-            img_info["file_name"] = None
+            img_info["file_name"] = None  # 如果是流数据，这里自然就是None了
 
         height, width = img.shape[:2]
         img_info["height"] = height
@@ -168,7 +171,7 @@ class Predictor(object):
                 outputs = self.decoder(outputs, dtype=outputs.type())
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre,
-                self.nmsthre, class_agnostic=False  # 2021/12/27：这里修改类别不可知为False
+                self.nmsthre, class_agnostic=True
             )
             logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
@@ -245,61 +248,6 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             break
 
 
-def imageflow_track_demo(predictor, vis_folder, current_time, args):
-    cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    save_folder = os.path.join(
-        vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-    )
-    os.makedirs(save_folder, exist_ok=True)
-    if args.demo == "video":
-        save_path = os.path.join(save_folder, args.path.split("/")[-1])
-    else:
-        save_path = os.path.join(save_folder, "camera.mp4")
-    logger.info(f"video save_path is {save_path}")
-    vid_writer = cv2.VideoWriter(
-        save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
-    )
-    tracker = BYTETracker(args, frame_rate=30)
-    frame_id = 0
-    results = []
-    while True:
-        ret_val, frame = cap.read()
-        if ret_val:
-            outputs, img_info = predictor.inference(frame)
-            logger.info(outputs)
-            if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
-                online_tlwhs = []
-                online_ids = []
-                online_scores = []
-                for t in online_targets:
-                    tlwh = t.tlwh
-                    tid = t.track_id
-                    if tlwh[2] * tlwh[3] > args.min_box_area:
-                        online_tlwhs.append(tlwh)
-                        online_ids.append(tid)
-                        online_scores.append(t.score)
-                        results.append(
-                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                        )
-                logger.info(online_tlwhs)
-                online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=0
-                )
-            else:
-                online_im = img_info['raw_img']
-            cv2.imshow('test', online_im)  # 2021/12/27 跟踪的文件保存不了，只能用imshow展示
-            # if args.save_result:
-            #     vid_writer.write(online_im)
-            ch = cv2.waitKey(1)
-            if ch == 27 or ch == ord("q") or ch == ord("Q"):
-                break
-        else:
-            break
-
 def main(exp, args):
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
@@ -369,12 +317,10 @@ def main(exp, args):
     if args.demo == "image":
         image_demo(predictor, vis_folder, args.path, current_time, args.save_result)
     elif args.demo == "video" or args.demo == "webcam":
-        # imageflow_demo(predictor, vis_folder, current_time, args)
-        imageflow_track_demo(predictor, vis_folder, current_time, args)
+        imageflow_demo(predictor, vis_folder, current_time, args)
+
 
 if __name__ == "__main__":
-    os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-
     args = make_parser().parse_args()
     exp = get_exp(args.exp_file, args.name)
 

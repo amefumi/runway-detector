@@ -30,7 +30,8 @@ def make_parser():
         type=str,
         help="url used to set up distributed training",
     )
-    parser.add_argument("-b", "--batch-size", type=int, default=8, help="batch size")  # 修改默认mini-batch size为8
+    parser.add_argument("-b", "--batch-size", type=int, default=8, help="batch size")
+    # 根据YOLOv5的经验，mini batch数量在8GB显存下最多可以到33个。这里修改默认mini-batch size为16。
     parser.add_argument(
         "-d", "--devices", default=0, type=int, help="device for training"  # 修改默认device为GPU0
     )
@@ -79,7 +80,7 @@ def make_parser():
         default=False,
         action="store_true",
         help="occupy GPU memory first for training.",
-    )
+    )  # 这里一般不能设置 -o先占据GPU显存。
     parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
