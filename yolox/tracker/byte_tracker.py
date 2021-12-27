@@ -157,23 +157,12 @@ class BYTETracker(object):
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilter()
 
-    def update(self, output_results, img_info, img_size):
+    def update(self, bboxes, scores):
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
-
-        if output_results.shape[1] == 5:
-            scores = output_results[:, 4]
-            bboxes = output_results[:, :4]
-        else:
-            output_results = output_results.cpu().numpy()
-            scores = output_results[:, 4] * output_results[:, 5]  # scores 是对象conf * 类别conf。注意“分类”是int(net_result[6])
-            bboxes = output_results[:, :4]  # x1y1x2y2
-        img_h, img_w = img_info[0], img_info[1]
-        scale = min(img_size[0] / float(img_h), img_size[1] / float(img_w))  # img_size是raw图像(1080)，img_h是缩放后的640
-        bboxes /= scale
 
         remain_inds = scores > self.args.track_thresh
         inds_low = scores > 0.1

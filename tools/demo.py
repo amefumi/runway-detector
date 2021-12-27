@@ -15,7 +15,6 @@ from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess, vis
-from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
@@ -24,7 +23,7 @@ IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 def make_parser():
     parser = argparse.ArgumentParser("YOLOX Demo!")
     parser.add_argument(
-        "demo", default="image", help="demo type, eg. image, video and webcam"
+        "demo", default="image", help="demo type, eg. image, video, track and webcam"
     )
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
@@ -107,15 +106,15 @@ def get_image_list(path):
 
 class Predictor(object):
     def __init__(
-        self,
-        model,
-        exp,
-        cls_names=COCO_CLASSES,
-        trt_file=None,
-        decoder=None,
-        device="cpu",
-        fp16=False,
-        legacy=False,
+            self,
+            model,
+            exp,
+            cls_names=COCO_CLASSES,
+            trt_file=None,
+            decoder=None,
+            device="cpu",
+            fp16=False,
+            legacy=False,
     ):
         self.model = model
         self.cls_names = cls_names
@@ -191,6 +190,41 @@ class Predictor(object):
         vis_res = vis(img, bboxes, scores, cls, cls_conf, self.cls_names)
         return vis_res
 
+    def track(self, output, tracker, img_info, frame_id):
+        ratio = img_info["ratio"]
+        img = img_info["raw_img"]
+        if output is None:
+            return img
+        output = output.cpu()
+
+        bboxes = output[:, 0:4]
+        bboxes /= ratio
+        cls = output[:, 6]
+        scores = output[:, 4] * output[:, 5]
+
+        online_targets = tracker.update(bboxes, scores)
+        online_tlwhs = []  # tlwh就是横、纵坐标、宽度、高度
+        online_bboxes = []
+        online_obj_ids = []
+        online_scores = []
+        for t in online_targets:
+            tlwh = t.tlwh
+            tid = t.track_id
+            if tlwh[2] * tlwh[3] > args.min_box_area:  # 绘制时（也可以理解为输出给外界时）对象面积不能小于min_box_area参数
+                online_tlwhs.append(tlwh)
+                online_bboxes.append([tlwh[0], tlwh[1], tlwh[2] + tlwh[0], tlwh[3] + tlwh[1]])
+                online_obj_ids.append(tid)
+                online_scores.append(t.score)
+                logger.info(
+                    f"{frame_id}, {cls}, {tid}, {tlwh[0]:.2f}, {tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f}\n"
+                )
+        track_res = vis(img, online_bboxes, online_scores, [0 for i in range(len(online_bboxes))], 0, self.cls_names,
+                        online_obj_ids)
+
+        # 绘制track时不需要考虑scores是否低于conf，这在追踪过程就已经考虑了。
+        # TODO: add cls_name for visualize
+        return track_res
+
 
 def image_demo(predictor, vis_folder, path, current_time, save_result):
     if os.path.isdir(path):
@@ -245,60 +279,37 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             break
 
 
-def imageflow_track_demo(predictor, vis_folder, current_time, args):
-    cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
+def imageflow_track_demo(predictor, track_floder, current_time, args):
+    cap = cv2.VideoCapture(args.path)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
     fps = cap.get(cv2.CAP_PROP_FPS)
     save_folder = os.path.join(
-        vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+        track_floder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
     )
     os.makedirs(save_folder, exist_ok=True)
-    if args.demo == "video":
-        save_path = os.path.join(save_folder, args.path.split("/")[-1])
-    else:
-        save_path = os.path.join(save_folder, "camera.mp4")
+    save_path = os.path.join(save_folder, args.path.split("/")[-1])
     logger.info(f"video save_path is {save_path}")
     vid_writer = cv2.VideoWriter(
         save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
     )
-    tracker = BYTETracker(args, frame_rate=30)
+    tracker = BYTETracker(args, frame_rate=fps)
     frame_id = 0
-    results = []
     while True:
         ret_val, frame = cap.read()
         if ret_val:
             outputs, img_info = predictor.inference(frame)
-            logger.info(outputs)
-            if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
-                online_tlwhs = []
-                online_ids = []
-                online_scores = []
-                for t in online_targets:
-                    tlwh = t.tlwh
-                    tid = t.track_id
-                    if tlwh[2] * tlwh[3] > args.min_box_area:
-                        online_tlwhs.append(tlwh)
-                        online_ids.append(tid)
-                        online_scores.append(t.score)
-                        results.append(
-                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                        )
-                logger.info(online_tlwhs)
-                online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=0
-                )
-            else:
-                online_im = img_info['raw_img']
-            cv2.imshow('test', online_im)  # 2021/12/27 跟踪的文件保存不了，只能用imshow展示
-            # if args.save_result:
-            #     vid_writer.write(online_im)
+            online_im = predictor.track(outputs[0], tracker, img_info, frame_id)
+            # cv2.imshow('test', online_im)  # 2021/12/27 跟踪的文件保存不了，只能用imshow展示
+            if args.save_result:
+                vid_writer.write(online_im)
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
         else:
             break
+        frame_id += 1
+
 
 def main(exp, args):
     if not args.experiment_name:
@@ -308,9 +319,12 @@ def main(exp, args):
     os.makedirs(file_name, exist_ok=True)
 
     vis_folder = None
+    track_folder = None
     if args.save_result:
         vis_folder = os.path.join(file_name, "vis_res")
+        track_folder = os.path.join(file_name, "track_res")
         os.makedirs(vis_folder, exist_ok=True)
+        os.makedirs(track_folder, exist_ok=True)
 
     if args.trt:
         args.device = "gpu"
@@ -368,9 +382,11 @@ def main(exp, args):
     current_time = time.localtime()
     if args.demo == "image":
         image_demo(predictor, vis_folder, args.path, current_time, args.save_result)
+    elif args.demo == "track":
+        imageflow_track_demo(predictor, track_folder, current_time, args)
     elif args.demo == "video" or args.demo == "webcam":
-        # imageflow_demo(predictor, vis_folder, current_time, args)
-        imageflow_track_demo(predictor, vis_folder, current_time, args)
+        imageflow_demo(predictor, vis_folder, current_time, args)
+
 
 if __name__ == "__main__":
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
