@@ -11,18 +11,21 @@ from .kalman_filter import KalmanFilter
 from yolox.tracker import matching
 from .basetrack import BaseTrack, TrackState
 
+
 class STrack(BaseTrack):
+    #  STrack应该是Single Track的意思。继承自BaseTrack类。
     shared_kalman = KalmanFilter()
+
     def __init__(self, tlwh, score):
 
         # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
+        self._tlwh = np.asarray(tlwh, dtype=np.float)  # tlwh = top, left, width, height
         self.kalman_filter = None
-        self.mean, self.covariance = None, None
+        self.mean = None
+        self.covariance = None
         self.is_activated = False
-
         self.score = score
-        self.tracklet_len = 0
+        self.tracklet_length = 0
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -49,7 +52,7 @@ class STrack(BaseTrack):
         self.track_id = self.next_id()
         self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xyah(self._tlwh))
 
-        self.tracklet_len = 0
+        self.tracklet_length = 0
         self.state = TrackState.Tracked
         if frame_id == 1:
             self.is_activated = True
@@ -61,7 +64,7 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh)
         )
-        self.tracklet_len = 0
+        self.tracklet_length = 0
         self.state = TrackState.Tracked
         self.is_activated = True
         self.frame_id = frame_id
@@ -78,7 +81,7 @@ class STrack(BaseTrack):
         :return:
         """
         self.frame_id = frame_id
-        self.tracklet_len += 1
+        self.tracklet_length += 1
 
         new_tlwh = new_track.tlwh
         self.mean, self.covariance = self.kalman_filter.update(
@@ -151,7 +154,7 @@ class BYTETracker(object):
 
         self.frame_id = 0
         self.args = args
-        #self.det_thresh = args.track_thresh
+        # self.det_thresh = args.track_thresh
         self.det_thresh = args.track_thresh + 0.1
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
         self.max_time_lost = self.buffer_size
@@ -159,25 +162,30 @@ class BYTETracker(object):
 
     def update(self, bboxes, scores):
         self.frame_id += 1
-        activated_starcks = []
+
+        activated_stracks = []
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
 
-        remain_inds = scores > self.args.track_thresh
-        inds_low = scores > 0.1
-        inds_high = scores < self.args.track_thresh
+        remain_idx = scores > self.args.track_thresh
+        idx_low = scores > 0.1
+        idx_high = scores < self.args.track_thresh
 
-        inds_second = np.logical_and(inds_low, inds_high)
-        dets_second = bboxes[inds_second]
-        dets = bboxes[remain_inds]
-        scores_keep = scores[remain_inds]
-        scores_second = scores[inds_second]
+        idx_second = np.logical_and(idx_low, idx_high)
+        # 如果假设tau_low = 0.1, tau_high = args.track_thresh，那么这里的idx_second指的是D_low，remain_idx指的是D_high
+        # 后续也会先对D_high进行分配。
 
-        if len(dets) > 0:
+        detection_low = bboxes[idx_second]
+        scores_low = scores[idx_second]
+        detection_high = bboxes[remain_idx]
+        scores_high = scores[remain_idx]
+
+        if len(detection_high) > 0:
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets, scores_keep)]
+            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for (tlbr, s) in zip(detection_high, scores_high)]
+            # 这里tlbr指的是(top, left, bottom, right)的YOLOX输出格式，tlwh指的是(top, left, width, height)的Track模式。
+            # 将D_high里面的所有候选框都作为STracks跟踪对象加入detections表
         else:
             detections = []
 
@@ -188,7 +196,7 @@ class BYTETracker(object):
             if not track.is_activated:
                 unconfirmed.append(track)
             else:
-                tracked_stracks.append(track)
+                tracked_stracks.append(track)  # self.tracked_stracks中保持activated状态的STracks
 
         ''' Step 2: First association, with high score detection boxes'''
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
@@ -204,28 +212,28 @@ class BYTETracker(object):
             det = detections[idet]
             if track.state == TrackState.Tracked:
                 track.update(detections[idet], self.frame_id)
-                activated_starcks.append(track)
+                activated_stracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
         ''' Step 3: Second association, with low score detection boxes'''
         # association the untrack to the low score detections
-        if len(dets_second) > 0:
+        if len(detection_low) > 0:
             '''Detections'''
             detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets_second, scores_second)]
+                                 (tlbr, s) in zip(detection_low, scores_low)]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
-        matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
+        matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.4)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
             det = detections_second[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
-                activated_starcks.append(track)
+                activated_stracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
@@ -244,7 +252,7 @@ class BYTETracker(object):
         matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
-            activated_starcks.append(unconfirmed[itracked])
+            activated_stracks.append(unconfirmed[itracked])
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.mark_removed()
@@ -256,7 +264,7 @@ class BYTETracker(object):
             if track.score < self.det_thresh:
                 continue
             track.activate(self.kalman_filter, self.frame_id)
-            activated_starcks.append(track)
+            activated_stracks.append(track)
         """ Step 5: Update state"""
         for track in self.lost_stracks:
             if self.frame_id - track.end_frame > self.max_time_lost:
@@ -266,7 +274,7 @@ class BYTETracker(object):
         # print('Ramained match {} s'.format(t4-t3))
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
-        self.tracked_stracks = joint_stracks(self.tracked_stracks, activated_starcks)
+        self.tracked_stracks = joint_stracks(self.tracked_stracks, activated_stracks)
         self.tracked_stracks = joint_stracks(self.tracked_stracks, refind_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.tracked_stracks)
         self.lost_stracks.extend(lost_stracks)
@@ -276,7 +284,9 @@ class BYTETracker(object):
         # get scores of lost tracks
         output_stracks = [track for track in self.tracked_stracks if track.is_activated]
 
-        return output_stracks
+        temporary_lost_stracks = [track for track in self.lost_stracks if track.state == TrackState.Lost]
+        logger.info(f"TLSTrack = {len(temporary_lost_stracks)}")
+        return output_stracks, temporary_lost_stracks
 
 
 def joint_stracks(tlista, tlistb):

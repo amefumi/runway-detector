@@ -5,6 +5,9 @@
 import argparse
 import os
 import time
+
+import facenet_pytorch.models.utils.training
+import numpy as np
 from loguru import logger
 
 import cv2
@@ -16,6 +19,8 @@ from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess, vis
 from yolox.tracker.byte_tracker import BYTETracker
+
+from ufld.model.model import LaneSelectNet
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -88,8 +93,12 @@ def make_parser():
     parser.add_argument("--track_thresh", type=float, default=0.5, help="tracking confidence threshold")
     parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
     parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
-    parser.add_argument('--min_box_area', type=float, default=4, help='filter out tiny boxes')
-    parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")  # TODO: 去掉无用的parser
+    parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
+    parser.add_argument("--mot20", dest="mot20", default=False, action="store_true",
+                        help="test mot20.")  # TODO: 去掉无用的parser
+    parser.add_argument("--dir_model", type=str, default="pretrained\\dir_full_step1.pth",
+                        help="path to direction model checkpoints")
+    parser.add_argument("--text", type=str, default="No Experiment Text!", help="text comments on exp videos.")
     return parser
 
 
@@ -115,6 +124,8 @@ class Predictor(object):
             device="cpu",
             fp16=False,
             legacy=False,
+            direction_model=None,
+            exp_text=None
     ):
         self.model = model
         self.cls_names = cls_names
@@ -126,6 +137,9 @@ class Predictor(object):
         self.device = device
         self.fp16 = fp16
         self.preproc = ValTransform(legacy=legacy)
+        self.direction_model = direction_model
+        self.exp_text = exp_text
+
         if trt_file is not None:
             from torch2trt import TRTModule
 
@@ -190,20 +204,27 @@ class Predictor(object):
         vis_res = vis(img, bboxes, scores, cls, cls_conf, self.cls_names)
         return vis_res
 
-    def track(self, output, tracker, img_info, frame_id):
+    def track(self, output, tracker, img_info, frame_id, cls_conf=0.35):
+        '''
+        track 是visual的一个重写，目的是加入inference之后对bbox的跟踪。
+        '''
         ratio = img_info["ratio"]
         img = img_info["raw_img"]
         if output is None:
-            return img
-        output = output.cpu()
+            output = np.array([[-1., -1., -1., -1., -1., 1., 99.]])
+        else:
+            output = output.cpu()
+
+        # 存在一个问题，如果没有检测到对象，则Track模型不会更新。
+        # 试图解决方法：加入一个固定的框。不予显示，促使算法一直跟踪。
 
         bboxes = output[:, 0:4]
         bboxes /= ratio
         cls = output[:, 6]
         scores = output[:, 4] * output[:, 5]
 
-        online_targets = tracker.update(bboxes, scores)
-        online_tlwhs = []  # tlwh就是横、纵坐标、宽度、高度
+        online_targets, temp_lost_targets = tracker.update(bboxes, scores)
+        online_tlwhs = []  # tlwh 就是横、纵坐标、宽度、高度
         online_bboxes = []
         online_obj_ids = []
         online_scores = []
@@ -218,12 +239,34 @@ class Predictor(object):
                 logger.info(
                     f"{frame_id}, {cls}, {tid}, {tlwh[0]:.2f}, {tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f}\n"
                 )
-        track_res = vis(img, online_bboxes, online_scores, [0 for i in range(len(online_bboxes))], 0, self.cls_names,
-                        online_obj_ids)
-
+        if not temp_lost_targets:
+            track_res = vis(img, online_bboxes, online_scores, [0 for i in range(len(online_bboxes))], cls_conf,
+                        self.cls_names, online_obj_ids, text=self.exp_text)
+        else:
+            track_res = vis(img, online_bboxes, online_scores, [0 for i in range(len(online_bboxes))], cls_conf,
+                            self.cls_names, online_obj_ids, text=self.exp_text)
         # 绘制track时不需要考虑scores是否低于conf，这在追踪过程就已经考虑了。
         # TODO: add cls_name for visualize
         return track_res
+
+    def direction(self, output, img_info, cls_conf=0.35):
+        ratio = img_info["ratio"]
+        img = img_info["raw_img"]
+        if output is None:
+            return img
+        output = output.cpu()
+
+        bboxes = output[:, 0:4]
+
+        # preprocessing: resize
+        bboxes /= ratio
+
+        cls = output[:, 6]
+        scores = output[:, 4] * output[:, 5]
+
+        vis_res = vis(img, bboxes, scores, cls, cls_conf, self.cls_names, direction_model=self.direction_model,
+                      text=self.exp_text)
+        return vis_res
 
 
 def image_demo(predictor, vis_folder, path, current_time, save_result):
@@ -243,6 +286,29 @@ def image_demo(predictor, vis_folder, path, current_time, save_result):
             save_file_name = os.path.join(save_folder, os.path.basename(image_name))
             logger.info("Saving detection result in {}".format(save_file_name))
             cv2.imwrite(save_file_name, result_image)
+        ch = cv2.waitKey(0)
+        if ch == 27 or ch == ord("q") or ch == ord("Q"):
+            break
+
+
+def image_direction(predictor, vis_folder, path, current_time, save_result):
+    if os.path.isdir(path):
+        files = get_image_list(path)
+    else:
+        files = [path]
+    files.sort()
+    for image_name in files:
+        outputs, img_info = predictor.inference(image_name)
+        result_image = predictor.direction(outputs[0], img_info, predictor.confthre)
+        if save_result:
+            save_folder = os.path.join(
+                vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+            )
+            os.makedirs(save_folder, exist_ok=True)
+            save_file_name = os.path.join(save_folder, os.path.basename(image_name))
+            logger.info("Saving detection result in {}".format(save_file_name))
+            cv2.imshow(save_file_name, result_image)
+            # cv2.imwrite(save_file_name, result_image)
         ch = cv2.waitKey(0)
         if ch == 27 or ch == ord("q") or ch == ord("Q"):
             break
@@ -279,16 +345,55 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             break
 
 
-def imageflow_track_demo(predictor, track_floder, current_time, args):
+def imageflow_demo_direction(predictor, vis_folder, current_time, args):
+    cap = cv2.VideoCapture(args.path if args.demo == "dir_video" else args.camid)
+    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
+    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    save_folder = os.path.join(
+        vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+    )
+    logger.info(f"save folder ={save_folder}")
+    os.makedirs(save_folder, exist_ok=True)
+
+    if args.demo == "dir_video":
+        save_path = os.path.join(save_folder, os.path.basename(args.path))
+    else:
+        save_path = os.path.join(save_folder, "camera.mp4")
+    logger.info(f"video save_path is {save_path}")
+    vid_writer = cv2.VideoWriter(
+        save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
+    )
+    while True:
+        ret_val, frame = cap.read()
+        if ret_val:
+            # height = frame.shape[0]
+            # width = frame.shape[1]
+            # mat_rotate = cv2.getRotationMatrix2D((height * 0.5, width * 0.5),18, 1)
+            # frame = cv2.warpAffine(frame, mat_rotate, (int(width), int(height)))
+
+            outputs, img_info = predictor.inference(frame)
+            result_frame = predictor.direction(outputs[0], img_info, predictor.confthre)
+            if args.save_result:
+                vid_writer.write(result_frame)
+                cv2.imshow("frame", result_frame)
+            ch = cv2.waitKey(1)
+            if ch == 27 or ch == ord("q") or ch == ord("Q"):
+                break
+        else:
+            break
+
+
+def imageflow_track_demo(predictor, track_folder, current_time, args):
     cap = cv2.VideoCapture(args.path)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
     fps = cap.get(cv2.CAP_PROP_FPS)
     save_folder = os.path.join(
-        track_floder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+        track_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
     )
     os.makedirs(save_folder, exist_ok=True)
-    save_path = os.path.join(save_folder, args.path.split("/")[-1])
+    save_path = os.path.join(save_folder, os.path.basename(args.path))
     logger.info(f"video save_path is {save_path}")
     vid_writer = cv2.VideoWriter(
         save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
@@ -300,9 +405,9 @@ def imageflow_track_demo(predictor, track_floder, current_time, args):
         if ret_val:
             outputs, img_info = predictor.inference(frame)
             online_im = predictor.track(outputs[0], tracker, img_info, frame_id)
-            # cv2.imshow('test', online_im)  # 2021/12/27 跟踪的文件保存不了，只能用imshow展示
             if args.save_result:
                 vid_writer.write(online_im)
+                cv2.imshow("Track", online_im)
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
@@ -375,13 +480,32 @@ def main(exp, args):
         trt_file = None
         decoder = None
 
+    if args.dir_model is None:
+        direction_model = None
+    else:
+        direction_model = LaneSelectNet(pretrained=False, backbone='34', net_para=(33, 45, 2), use_aux=False).cuda()
+        state_dict = torch.load(args.dir_model, map_location='cpu')['model']
+        compatible_state_dict = {}
+        for k, v in state_dict.items():
+            if 'module.' in k:
+                compatible_state_dict[k[7:]] = v
+            else:
+                compatible_state_dict[k] = v
+        direction_model.load_state_dict(compatible_state_dict, strict=False)
+        direction_model.eval()
+
     predictor = Predictor(
         model, exp, COCO_CLASSES, trt_file, decoder,
-        args.device, args.fp16, args.legacy,
+        args.device, args.fp16, args.legacy, direction_model=direction_model, exp_text=args.text
     )
     current_time = time.localtime()
+    logger.info(f"vis folder ={vis_folder}, track folder ={track_folder}")
     if args.demo == "image":
         image_demo(predictor, vis_folder, args.path, current_time, args.save_result)
+    elif args.demo == "dir_image":
+        image_direction(predictor, vis_folder, args.path, current_time, args.save_result)
+    elif args.demo == "dir_video":
+        imageflow_demo_direction(predictor, vis_folder, current_time, args)
     elif args.demo == "track":
         imageflow_track_demo(predictor, track_folder, current_time, args)
     elif args.demo == "video" or args.demo == "webcam":

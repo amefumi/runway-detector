@@ -2,7 +2,6 @@
 import numpy as np
 import scipy.linalg
 
-
 """
 Table for the 0.95 quantile of the chi-square distribution with N degrees of
 freedom (contains values for N=1, ..., 9). Taken from MATLAB/Octave's chi2inv
@@ -116,7 +115,7 @@ class KalmanFilter(object):
             self._std_weight_velocity * mean[3]]
         motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
 
-        #mean = np.dot(self._motion_mat, mean)
+        # mean = np.dot(self._motion_mat, mean)
         mean = np.dot(mean, self._motion_mat.T)
         covariance = np.linalg.multi_dot((
             self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
